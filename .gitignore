@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local runtime output and captures
+*.jsonl
+*.log
+gogo_baseline.json
+
+# Editors and OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

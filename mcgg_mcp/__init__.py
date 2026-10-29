@@ -1,0 +1,1 @@
+"""MCGG MCP server."""
