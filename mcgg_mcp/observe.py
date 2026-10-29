@@ -358,6 +358,8 @@ class Observer:
                          'population': m.population, 'pop_max': m.pop_max,
                          'power': m.power(), 'interest': interest_for(m.coin),
                          'next_interest_at': next_breakpoint(m.coin),
+                         # gold above the 50-gold interest cap earns nothing: spend it in prep
+                         'idle_gold': max(0, m.coin - 50),
                          'account': m.account}
         if 'shop' in secs:
             slots = []
@@ -479,19 +481,21 @@ def legal_actions(m: S.Match, gogo_active: bool = False,
     if welfare_active:
         acts.append('welfare_pick')   # the guard waits for the turn and checks it
     if not auction_active:
-        if m.shop:
+        # the shop only takes purchases while shopping: observed in a fight, the shop panel
+        # was closed and buy_hero was still listed as legal (the call was then refused)
+        if m.shop and m.shopping:
             acts.append('buy_hero')
             acts.append('lock_shop')
-        if m.coin >= 1 and m.shop:
+        if m.shop and m.shopping and m.coin >= m.refresh_cost:
             acts.append('reroll_shop')
-        if m.level_price and m.coin >= m.level_price:
+        if m.level_price and m.shopping and m.coin >= m.level_price:
             acts.append('buy_xp')
         if m.bench or m.board:
             acts.append('sell_hero')
-        if m.free_items():
+        if m.free_items() and m.shopping:  # equipping is a prep action (fights lock the board)
             acts.append('equip')
-            if m.shopping and any(u.name for u in m.board):
-                acts.append('equip_best')
+        if m.shopping and any(u.name for u in m.board) and m.items:
+            acts.append('equip_best')  # re-solves all items onto the deployed heroes
         if any(x.owner for x in m.items) and m.shopping:
             acts.append('unequip')
         if m.shopping:
@@ -516,7 +520,7 @@ def render_text(o: dict, m: S.Match) -> str:
                         (o.get('shop') or {}).get('bench_free')))
         for s in slots:
             tag = '  -> %s' % s['makes'] if s.get('makes') else ''
-            lines.append('  [%s] %-10s %sg q%s%s' % (s['slot'], s['name'], s['cost'], s['quality'], tag))
+            lines.append('  [%s] %-10s %sg%s' % (s['slot'], s.get('name'), s.get('cost'), tag))
     bench = o.get('bench') or []
     if bench:
         lines.append('bench: ' + ' | '.join('%s %s* (%s)' % (b['name'], b['star'], b['slot'])

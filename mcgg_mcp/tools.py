@@ -106,8 +106,9 @@ TOOLS = [
 
     tool('move_to_cell', 'Move hero to a board cell',
          'Place a hero on (x,y) of the 7x6 board. Works for a board hero (moves it) and a bench '
-         'hero (deploys it). Shopping phases only; returns HERO_SLOTS_FULL when the board '
-         'has no room, and NO_EFFECT when the cell is occupied.',
+         'hero (deploys it). Shopping phases only. During prep only rows 0-2 are accepted '
+         '(y 3-5 returns BAD_ARGUMENT). Returns HERO_SLOTS_FULL when the board has no room, '
+         'and BAD_ARGUMENT when the cell is occupied.',
          {'hero_guid': {'type': 'integer'},
           'x': {'type': 'integer', 'minimum': 0, 'maximum': 6},
           'y': {'type': 'integer', 'minimum': 0, 'maximum': 5}},
@@ -126,26 +127,39 @@ TOOLS = [
           'to_slot': {'type': 'integer', 'minimum': 1, 'maximum': 9}},
          ['from_slot', 'to_slot']),
 
-    tool('auto_deploy', 'Auto-arrange the board',
-         'Let the game place your units. Shopping phases only.',
+    tool('auto_deploy', 'Best board layout for the whole roster',
+         'Plans the layout from every named hero on the board and bench: which heroes to field '
+         '(capped by board capacity) and where (tanks front, ranged carries back, synergy '
+         'breakpoints, few moves). Applies the plan with the game\'s own move calls, one verified '
+         'step at a time. Returns the steps taken; a failed step stops the plan. Shopping phases only.',
          annotations={'idempotentHint': True}),
 
-    tool('equip', 'Equip an item or crystal on a hero',
-         'Slots: 1 = special slot (only place a Choice Magic Crystal can go), 2-4 = item slots. '
-         'Equipping the crystal into slot 1 opens its three bond options, which crystal_select then commits.',
+    tool('equip', 'Equip an item or crystal on a board hero',
+         'Worn items use slots 1-3 (a free slot is picked when slot is omitted). A crystal always '
+         'lands in the crystal slot (observe shows it as 4); its bond options then come from '
+         'crystal_select. Only heroes on the board take items. Verified: a call that does not land '
+         'within 3 s returns NO_EFFECT.',
          {'item_guid': {'type': 'integer'},
           'hero_guid': {'type': 'integer'},
-          'slot': {'type': 'integer', 'minimum': 1, 'maximum': 4, 'default': 1,
-                   'description': '1 = special (crystal), 2-4 = normal item slots'}},
+          'slot': {'type': 'integer', 'minimum': 1, 'maximum': 4,
+                   'description': 'worn-item slot 1-3; omit to take the first free one. Ignored for '
+                                  'crystals, which go to the crystal slot.'}},
          ['item_guid', 'hero_guid'], {'idempotentHint': True}),
 
-    tool('equip_best', 'Equip every bag item on the carry',
-         'Distribute all free items onto the strongest hero (highest star then quality).',
+    tool('equip_best', 'Best item distribution over the board',
+         'Plans the optimal placement of every equipment item (bag and worn) across the board '
+         'heroes, up to three items per hero, by item family vs hero role and damage type. Moves '
+         'worn items to other heroes (unequip, then equip) and bag items onto heroes. Crystals are '
+         'not touched. Applies the plan one verified step at a time. Shopping phases only.',
          annotations={'idempotentHint': True}),
 
     tool('unequip', 'Return an item to the bag',
-         'Return an equipped item to the bag (verified). Shopping phases only.',
-         {'item_guid': {'type': 'integer'}}, ['item_guid'],
+         'Return an equipped item to the bag (verified). Shopping phases only. Removing a crystal '
+         'drops its bond from the hero, so it needs confirm_bond_loss=true.',
+         {'item_guid': {'type': 'integer'},
+          'confirm_bond_loss': {'type': 'boolean', 'default': False,
+                                'description': 'required to remove a Magic Crystal'}},
+         ['item_guid'],
          {'destructiveHint': True}),
 
     tool('pick_item', 'Resolve a pending item offer',

@@ -140,12 +140,23 @@ class Match:
         return sum((u.star or 1) * (u.quality or 1) for u in self.board if u.name)
 
     def rev(self) -> int:
+        # Outside the shopping phases the board, gold, HP and shop move every frame (units
+        # walk, income ticks, damage lands), so an expect_rev taken in a fight was stale a
+        # moment later. There the revision only tracks what a fight action can depend on:
+        # the round, the phase, the prompts and the bonds.
+        if not self.shopping:
+            sig = {
+                'r': self.round_no, 'p': self.phase,
+                'o': [x.get('guid') for x in self.offers],
+                'd': [(str(x.get('id')), str(x.get('value'))) for x in self.bonds],
+            }
+            return int(hashlib.md5(json.dumps(sig, sort_keys=True, default=str).encode()).hexdigest()[:8], 16)
         sig = {
             'r': self.round_no, 'p': self.phase, 'c': self.coin, 'l': self.level,
             'hp': self.hp, 's': [(x.slot, x.hero_id, x.cost) for x in self.shop],
             'b': [(x.slot, x.guid, x.name) for x in self.bench],
             'u': [(x.guid, x.hero_id, x.x, x.y, tuple(x.items)) for x in self.board],
-            'i': [(x.guid, x.owner) for x in self.items],
+            'i': [(x.guid, x.owner, x.slot) for x in self.items],
             'o': [x.get('guid') for x in self.offers],
             'd': [(str(x.get('id')), str(x.get('value'))) for x in self.bonds],
         }
@@ -190,6 +201,11 @@ def parse(payload: dict) -> Match:
         # a unit without a hero name is a non-hero board entity (its guid changes on every
         # read); leave it out so counts and copies only describe real heroes
         if not x.get('name'):
+            continue
+        # during a fight the bridge's board list also carries the opponents' units (the
+        # 19-unit fight board seen live). Keep only units that belong to this account.
+        owner = i(x.get('accountId'))
+        if m.account and owner and owner != m.account:  # 0 = unknown owner, keep the unit
             continue
         m.board.append(Unit(guid=i(x.get('guid')), hero_id=i(x.get('heroId')), name=x.get('name'),
                             star=i(x.get('star')), quality=oi(x.get('quality')),

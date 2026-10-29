@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import time
 
+import gear
+import layout
 import state as S
 from bridge import Bridge, BridgeError
 from observe import Observer, legal_actions
@@ -26,12 +28,21 @@ ALTAR_BLOCKED = {'buy_hero', 'reroll_shop', 'sell_hero', 'lock_shop',
                  'move_to_cell', 'move_to_bench', 'swap_bench', 'auto_deploy'}
 
 
+def is_crystal(name) -> bool:
+    """Magic Crystals (including the Choice Magic Crystal) use the crystal slot, not 1-3."""
+    return 'Crystal' in (name or '')
+
+
 class FullError(ValueError):
     """The board or bench has no room. Reported as HERO_SLOTS_FULL, not as a silent no-op."""
 
 
 class LockedError(ValueError):
     """The action is valid only in a shopping phase. Reported as PHASE_LOCKED."""
+
+
+class WelfareLockedError(ValueError):
+    """welfare_pick was called outside your welfare turn. Reported as WELFARE_LOCKED."""
 
 
 class Engine:
@@ -49,10 +60,22 @@ class Engine:
         self.stamps = [s for s in self.stamps if now - s < 60]
         return len(self.stamps) < self.max_per_minute
 
+    def _prompt_flags(self, m: S.Match) -> dict:
+        """Open-prompt state that decides which prompt tools are legal right now."""
+        return {'gogo_active': bool(self.o.gogo_state().get('active', False)),
+                'crystal_active': bool(self.o.crystal_state().get('active', False)),
+                'auction_active': self._altar_active(),
+                'welfare_active': bool(self.o.welfare_state(m.raw).get('active'))}
+
     def _deny(self, code: str, message: str, hint: str, m: S.Match | None,
               extra: dict | None = None) -> dict:
-        err = {'code': code, 'message': message, 'hint': hint,
-               'legal': legal_actions(m) if m else []}
+        legal = []
+        if m:
+            try:
+                legal = legal_actions(m, **self._prompt_flags(m))
+            except Exception:  # the list is advisory in a refusal; never hide the real error
+                legal = legal_actions(m)
+        err = {'code': code, 'message': message, 'hint': hint, 'legal': legal}
         if extra:
             err.update(extra)
         return {'ok': False, 'error': err}
@@ -94,11 +117,7 @@ class Engine:
             return self._deny('ALTAR_ACTIVE', 'altar phase is running',
                               'wait_for(altar_free=True)', m)
 
-        if tool not in legal_actions(m,
-                                     gogo_active=bool(self.o.gogo_state().get('active', False)),
-                                     crystal_active=bool(self.o.crystal_state().get('active', False)),
-                                     auction_active=self._altar_active(),
-                                     welfare_active=bool(self.o.welfare_state(m.raw).get('active'))):
+        if tool not in legal_actions(m, **self._prompt_flags(m)):
             return self._deny('NOT_LEGAL', f'{tool} is not legal in {m.phase}',
                               'read observe().legal', m)
 
@@ -115,6 +134,8 @@ class Engine:
             return self._deny('BAD_ARGUMENT', f'missing argument {e}', 'check the schema', m)
         except FullError as e:
             return self._deny('HERO_SLOTS_FULL', str(e), 'free a slot, then retry', m)
+        except WelfareLockedError as e:
+            return self._deny('WELFARE_LOCKED', str(e), 'wait_for(welfare_turn=true)', m)
         except LockedError as e:
             return self._deny('PHASE_LOCKED', str(e), "wait_for(phase='GamePhasePrepare')", m)
         except ValueError as e:
@@ -153,8 +174,164 @@ class Engine:
             return ('the shop/bench is probably full ("Hero Slots are full"); '
                     'sell a weak unit first, then retry')
         if tool == 'equip':
-            return 'the item did not move; check the hero slot (1-3) and that the phase is not combat'
+            return ('the item did not land on the hero within 3 s or the game refused it; '
+                    'check the phase is prep, the hero is on the board, and the slot is free '
+                    '(observe().items.on shows the slots; worn items use 1-3, crystals use 4)')
+        if tool == 'unequip':
+            return 'the item did not return to the bag; observe again before retrying'
         return 'observe again; the action may require a different target'
+
+    # ---- layout and gear (planned in layout.py and gear.py) ----------------
+    def _slot_capacity(self):
+        """The board's slot capacity from the game (m_PlayerData.m_iSlotPopulation).
+
+        `player.maxPopulation` is not the board capacity: a live board held five heroes while
+        maxPopulation read 2. None when the value cannot be read."""
+        try:
+            r = self.b.probe(S.LBM + '.m_PlayerData') or {}
+            return int((r.get('members') or {}).get('m_iSlotPopulation'))
+        except (BridgeError, TypeError, ValueError):
+            return None
+
+    def _auto_deploy(self, m: S.Match):
+        """Best board layout for the whole roster, applied one verified move at a time."""
+        cap = self._slot_capacity()
+        if not cap:
+            raise ValueError('board capacity reads 0 (no board slots this round); retry in prep')
+        plan = layout.plan(m, cap=cap)
+        if not plan.steps:
+            return {'ok': True, 'moves': 0, 'benched': plan.benched,
+                    'note': 'layout already matches the plan'}, None
+        done = []
+        for kind, guid, cell in plan.steps:
+            cur = self.o.load()
+            if not cur.shopping:  # the game refuses moves once the fight starts
+                return {'ok': False, 'stopped': 'phase changed', 'phase': cur.phase,
+                        'moves_verified': sum(1 for d in done if d['verified']), 'steps': done,
+                        'hint': "wait_for(phase='GamePhasePrepare'), then retry auto_deploy"}, False
+            if kind == 'to_bench':
+                used = {b.slot for b in cur.bench}
+                slot = next((s for s in range(1, 10) if s not in used), None)
+                if slot is None:
+                    raise FullError('the bench is full; cannot move a hero off the board')
+                res = self.b.call(S.LBM, 'MoveHeroToReserve', guid, slot, 'false', 'false')
+                def landed(after, g=guid):
+                    return any(b.guid == g for b in after.bench)
+            elif kind == 'move':
+                x, y = cell
+                res = self.b.call(S.LBM, 'MoveHeroInBattleField', guid, x, y, 'false')
+                def landed(after, g=guid, c=cell):
+                    return any(u.guid == g and (u.x, u.y) == c for u in after.board)
+            else:  # deploy: bench hero onto the board
+                x, y = cell
+                res = self.b.call(S.LBM, 'MoveHeroToBattleField', guid, x, y, 'false', 'false')
+                def landed(after, g=guid, c=cell):
+                    return any(u.guid == g and (u.x, u.y) == c for u in after.board)
+            ok = self._poll(landed, tries=16, pause=0.25)  # the game can land a deploy after ~2 s
+            done.append({'step': kind, 'guid': guid, 'cell': cell, 'verified': ok,
+                         'game_result': res.get('result')})
+            if not ok:
+                return {'ok': False, 'moves_verified': sum(1 for d in done if d['verified']),
+                        'failed_step': done[-1], 'steps': done,
+                        'hint': 'read observe().board and bench, then retry auto_deploy'}, False
+        return {'ok': True, 'moves': len(done), 'benched': plan.benched,
+                'score': round(plan.score, 3), 'steps': done}, True
+
+    def _equip_best(self, m: S.Match):
+        """Optimal item distribution over the board, applied one verified step at a time."""
+        plan = gear.plan(m)
+        if not plan.steps:
+            return {'ok': True, 'moves': 0, 'note': 'items already placed by the plan'}, None
+        names = {h.guid: h.name for h in layout.roster_from_match(m)}
+        done = []
+        for step in plan.steps:
+            cur = self.o.load()
+            if not cur.shopping:
+                return {'ok': False, 'stopped': 'phase changed', 'phase': cur.phase,
+                        'moves_verified': sum(1 for d in done if d['verified']), 'steps': done,
+                        'hint': "wait_for(phase='GamePhasePrepare'), then retry equip_best"}, False
+            if step[0] == 'unequip':
+                _, item, owner = step
+                res = self.b.act(op='unequip', item=item)
+                def landed(after, it=item):
+                    return any(x.guid == it and not x.owner for x in after.items)
+            else:
+                _, item, hero, slot = step
+                res = self.b.equip(item, hero, slot)
+                def landed(after, it=item, h=hero):
+                    return any(x.guid == it and x.owner == h for x in after.items)
+            ok = self._poll(landed, tries=8, pause=0.25)
+            done.append({'step': step[0], 'item': item, 'verified': ok})
+            if not ok:
+                return {'ok': False, 'moves_verified': sum(1 for d in done if d['verified']),
+                        'failed_step': done[-1], 'steps': done,
+                        'hint': 'read observe().items and the equipped units, then retry'}, False
+        summary = {}
+        item_names = {x.guid: x.name for x in m.items}
+        for it, hero in plan.assign.items():
+            if hero is not None:
+                summary.setdefault(names.get(hero, str(hero)), []).append(item_names.get(it, str(it)))
+        return {'ok': True, 'moves': len(done), 'total_fit': round(plan.total_fit, 2),
+                'summary': summary, 'steps': done}, True
+
+    def _name(self, x) -> str:
+        """Owned items can arrive without a name in the raw state; fall back to the item id."""
+        return x.name or self.o.item_name(x.item_id) or ''
+
+    def _equip(self, item_guid: int, hero_guid: int, slot_arg, m: S.Match):
+        """Equip one item (or crystal) onto a deployed hero, verified by the hero's own items.
+
+        Worn items use game slots 1-3; a crystal always lands in the special crystal slot,
+        which observe() shows as slot 4. A requested slot that the hero already uses is refused
+        here instead of being sent, because the game's refusal arrives as a silent no-op."""
+        it = next((x for x in m.items if x.guid == item_guid), None)
+        if it is None:
+            raise ValueError(f'item {item_guid} is not in the bag or worn (read observe().items)')
+        if not any(u.guid == hero_guid for u in m.board):
+            raise ValueError('items go only to heroes on the board; move the hero onto the board first')
+        if it.owner == hero_guid:
+            raise ValueError(f'{self._name(it)} is already on that hero')
+        crystal = is_crystal(self._name(it))
+        if crystal and it.owner:
+            raise ValueError('moving a crystal drops its bond; unequip it with confirm_bond_loss=true first')
+        if it.owner:
+            # worn items move by taking them off first, then equipping (the same two steps
+            # equip_best uses); the bag slot must be free before the second step
+            self.b.act(op='unequip', item=item_guid)
+            if not self._poll(lambda after: any(x.guid == item_guid and not x.owner for x in after.items),
+                              tries=12, pause=0.25):
+                return {'ok': False, 'stopped': 'unequip did not land'}, False
+            m = self.o.load()
+        held = [x for x in m.items if x.owner == hero_guid]
+        if crystal:
+            if any(x.slot == 4 or is_crystal(self._name(x)) for x in held):
+                raise ValueError('that hero already has a crystal; unequip it first '
+                                 '(confirm_bond_loss=true, because its bond is lost)')
+            game_slot = 1  # the request value the game accepts for a crystal; it stores it in slot 4
+        else:
+            if slot_arg is not None and int(slot_arg) not in gear.ITEM_SLOTS:
+                raise ValueError(f'slot {slot_arg} is not a worn-item slot; use 1-3 '
+                                 '(slot 4 is the crystal slot)')
+            taken = {x.slot: self._name(x) for x in held if x.slot in gear.ITEM_SLOTS}
+            if slot_arg is not None:
+                game_slot = int(slot_arg)
+                if game_slot in taken:
+                    raise ValueError(f'slot {game_slot} already holds {taken[game_slot]}; pick a free '
+                                     'slot or unequip it first')
+            else:
+                free = [s for s in gear.ITEM_SLOTS if s not in taken]
+                if not free:
+                    raise ValueError('the hero already has three items; unequip one first')
+                game_slot = free[0]
+        res = self.b.equip(item_guid, hero_guid, game_slot)
+        if not res.get('ok', True) or str(res.get('result')).lower() == 'false' or res.get('newSlot') == -1:
+            return res, False  # the game refused the call outright
+        if crystal:
+            # a Choice Magic Crystal is replaced by a new versatile guid, so match on the slot
+            landed = lambda after: any(x.owner == hero_guid and x.slot == 4 for x in after.items)
+        else:
+            landed = lambda after: any(x.guid == item_guid and x.owner == hero_guid for x in after.items)
+        return res, self._poll(landed, tries=12, pause=0.25)
 
     # ---- readback helpers ---------------------------------------------------
     def _poll(self, check, tries: int = 8, pause: float = 0.25) -> bool:
@@ -241,19 +418,21 @@ class Engine:
                 # only a level increase proves the level-up; a coin drop can come from
                 # another action (reroll, buy) and must not count as success
                 return after.level > m.level
-            return res, self._poll(leveled, tries=16, pause=0.25)
+            ok = self._poll(leveled, tries=16, pause=0.25)
+            # the bridge's levelBefore/levelAfter are read at the call, before the game applies
+            # the change (observed: levelAfter 6 while the level was 7), so report what the
+            # observation shows after the poll instead
+            after = self.o.load()
+            seen = {'levelBefore': m.level, 'levelAfter': after.level,
+                    'coinBefore': m.coin, 'coinAfter': after.coin}
+            return (seen if ok else {**res, **seen}), ok
 
         if tool == 'lock_shop':
             want = bool(a.get('locked', True))
             return self.b.call(S.LBM + '.m_LogicHeroShop', 'SetLockShop', want), None
 
         if tool == 'auto_deploy':
-            before = {(u.guid, u.x, u.y) for u in m.board}
-            bench0 = len(m.bench)
-            res = self.b.deploy()
-            def deployed(after):
-                return {(u.guid, u.x, u.y) for u in after.board} != before or len(after.bench) != bench0
-            return res, self._poll(deployed, tries=6, pause=0.25)
+            return self._auto_deploy(m)
 
         if tool == 'move_to_cell':
             guid, x, y = int(a['hero_guid']), int(a['x']), int(a['y'])
@@ -315,37 +494,22 @@ class Engine:
             return res, self._poll(swapped, tries=6, pause=0.25)
 
         if tool == 'equip':
-            item, hero = int(a['item_guid']), int(a['hero_guid'])
-            res = self.b.equip(item, hero, int(a.get('slot', 1)))
-            after = self.o.load()
-            moved = next((x for x in after.items if x.guid == item), None)
-            verified = bool(moved and moved.owner == hero)
-            if not verified:
-                # Choice Magic Crystal transforms into a new versatile-crystal guid,
-                # so the bag guid cannot be used to verify; trust the game's slot result.
-                api_ok = bool(res.get('ok')) and str(res.get('result')) not in ('False', 'false')
-                verified = api_ok and res.get('newSlot') is not None
-            return res, verified
+            return self._equip(int(a['item_guid']), int(a['hero_guid']), a.get('slot'), m)
 
         if tool == 'equip_best':
-            target = max((u for u in m.board if u.name),
-                         key=lambda u: ((u.star or 1), (u.quality or 1)))
-            out, used, placed = [], len(target.items), 0
-            for it in m.free_items():
-                used += 1
-                if used > 3:
-                    break
-                r = self.b.equip(it.guid, target.guid, used)
-                out.append(r)
-                if r.get('ok'):
-                    placed += 1
-            return {'ok': placed > 0, 'hero': target.name, 'placed': placed, 'results': out}, None
+            return self._equip_best(m)
 
         if tool == 'unequip':
             item = int(a['item_guid'])
             owner = next((x.owner for x in m.items if x.guid == item), 0)
             if not owner:
                 raise ValueError('item is not equipped on a hero')
+            worn = next(x for x in m.items if x.guid == item)
+            if is_crystal(self._name(worn)) and not a.get('confirm_bond_loss'):
+                # a crystal's bond is part of the hero's synergy count: removing it dropped a
+                # Defender count from 4 to 2 in a live match, so it needs an explicit yes
+                raise ValueError('unequipping a crystal removes its bond from the hero; '
+                                 'pass confirm_bond_loss=true to do it')
             res = self.b.act(op='unequip', item=item)
             def bagged(after):
                 it = next((x for x in after.items if x.guid == item), None)
@@ -382,8 +546,8 @@ class Engine:
             if not wel.get('active'):
                 raise LockedError('no welfare reward selection is running')
             if not wel.get('my_turn'):
-                raise LockedError(f"it was not your turn within {budget:g}s (your state: "
-                                  f"{wel.get('my_state')})")
+                raise WelfareLockedError(f"it was not your turn within {budget:g}s (your state: "
+                                         f"{wel.get('my_state')})")
             tried = []
             for name in order:
                 if name not in clicker.WELFARE_CARDS:
@@ -439,10 +603,8 @@ class Engine:
             if a.get('index') is not None:
                 idx = int(a.get('index'))
                 if idx < 0 or idx >= len(cards):
-                    return {'ok': False,
-                            'error': {'code': 'BAD_ARGUMENT',
-                                      'message': f'index {idx} out of range ({len(cards)} cards)',
-                                      'hint': 'read observe().pending.gogo.cards'}}, False
+                    raise ValueError(f'index {idx} out of range ({len(cards)} cards); '
+                                     'read observe().pending.gogo.cards')
                 cid = cards[idx].get('id')
                 # SelectCard(cardId, slotIndex, forceAdd) - takes the card at that slot
                 res = self.b.call(S.GOGO, 'SelectCard', cid, idx, 'false')
